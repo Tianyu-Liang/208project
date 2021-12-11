@@ -1,10 +1,14 @@
 
 overall = 0
 iter_overall = 0
+@everywhere PART_ONE = 1
+@everywhere PART_TWO = 2
 # return U and M such that A ~= U^TM, k is the rank, lambda is the regularizing constant
-@everywhere function compute_factor(A_row, A_col, k::Int64, lambda::Float64, max_iter::Int64)
-    U = zeros(k, length(A_row))
-    M = zeros(k, length(A_col))
+@everywhere function compute_factor(dis_U, dis_M, dis_row, dis_col, k::Int64, lambda::Float64, max_iter::Int64)
+    A_row = localpart(dis_row)
+    A_col = localpart(dis_col)
+    U = localpart(dis_U)
+    M = localpart(dis_M)
     sampling_factor = 2.5
     # initialize M by assigning average movie of that movie as first row
 
@@ -73,6 +77,64 @@ iter_overall = 0
     end
 
     return U', M
+end
+
+@everywhere in_range(x::Int64, idx_range::Array{Int64, 1}) = (x >= idx_range[1] && x <= idx_range[2])
+
+
+@everywhere function locate_indices(A_row_or_col, dis_U_or_M)
+    s = Dict{Int64, Tuple}() # tracks repetition
+    s_location_tup = Vector{Vector{Tuple{Int64, Int64}}}() # track for each index, where their location (in the fetched array) is
+    probes = procs(dis_U_or_M) 
+    process_idx = Vector{Vector{Int64}}() # tracks the indices each machine has
+    for p in probes
+        push!(process_idx, zeros(Int64, 0))
+    end
+
+    for i in eachindex(A_row_or_col)
+        indices = A_row_or_col[i].index
+        push!(s_location_tup, Vector{Tuple{Int64, Int64}}())
+        loc_vec = s_location_tup[end]
+
+        for j_idx in eachindex(indices)
+            j = indices[j_idx]
+            relative_idx = DistributedArrays.locate(dis_U_or_M, j)[PART_ONE]
+            idx = probes[relative_idx]
+            # put j and the tuple(which machine, how many from machine so far) in map
+            correspond = length(process_idx[relative_idx]) + 1
+            tup = get!(s, j, (relative_idx, correspond))
+
+            # check if j has already been added
+            if tup == (relative_idx, correspond) # if new
+                idx_array = process_idx[relative_idx]
+                push!(idx_array, j)
+            end
+
+            # store the location for look up later
+            push!(loc_vec, tup)
+                
+            
+        end
+    end
+
+    # find the direct index (rather than tuple) that corresponds to the location in fetched array
+    individual_len = zeros(Int64, length(process_idx))
+    for i in eachindex(individual_len)
+        individual_len[i] = length(process_idx[i])
+    end
+    cumulative = [0; cumsum(individual_len)]
+    s_location_vec = Vector{Vector{Int64}}()
+    for vec in s_location
+        last_vec = zeros(Int64, length(vec))
+        for i in eachindex(vec)
+            tup = vec[i]
+            last_vec[i] = cumulative[tup[PART_ONE]] + tup[PART_TWO]
+        end
+        push!(s_location_vec, last_vec)
+    end
+    
+    return process_idx, s_location_vec
+    
 end
 
 

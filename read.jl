@@ -9,6 +9,8 @@ using Distributed
 @everywhere using FFTW
 @everywhere using LowRankApprox
 @everywhere using Krylov
+@everywhere using DistributedArrays
+@everywhere using CUDA
 # @everywhere using Krylov
 include("algorithm.jl")
 
@@ -27,17 +29,64 @@ end
 #     id_mapping[movieId[i]] = i
 # end
 
-function gooby()
-    # read in data
-    rating_csv = CSV.File(open("ml-25m/ratings.csv"); limit=2000000, select=[1,2,3])
-    df = DataFrame(rating_csv)
+
+@everywhere function init_distributed_data_node(tup)
+    tup_len = length(tup[1])
+    
+    ret = Array{sparse_data_node, 1}(undef, tup_len)
+    for i = 1 : tup_len
+        ret[i] = sparse_data_node(zeros(Float64, 0), zeros(Int64, 0), 0)
+    end
+    return ret
+end
+
+@everywhere function fill_with_data!(dis::DArray, data; id_mapping=[])
+    loc = localpart(dis)
+    loc_idx = localindices(dis)[1]
+    if isempty(id_mapping)
+        for i = 1 : length(data)
+            loc[i] = sparse_data_node(copy(data[i].rating), copy(data[i].userId), loc_idx[1] + i - 1)
+        end
+    else
+        if id_mapping == -1
+            id_mapping = 1 : length(data)
+        end
+        for i = 1 : length(data)
+            loc[i] = sparse_data_node(copy(data[i].rating), copy(id_mapping[data[i].movieId]), loc_idx[1] + i - 1)
+        end
+    end
+end
+
+
+
+@everywhere function initialize_movie()
+     # read in data
+     rating_csv = CSV.File(open("ml-25m/ratings.csv"); limit=200000, select=[1,2,3])
+     df = DataFrame(rating_csv)
+
+     return df
+end
+
+
+@everywhere function movie_problem()
+    df = initialize_movie()
+    gd_col = groupby(df, :movieId; sort=true)
+
+    probes = procs()
+    dis_col = DArray(tup -> init_distributed_data_node(tup), (length(gd_col),), probes, (length(probes),))
     
     # stored in compressed column format
-    gd_col = groupby(df, :movieId; sort=true)
+    dis_indices = dis_col.cuts[1]
+    @sync for p_idx in eachindex(probes)
+        @async remotecall_fetch(fill_with_data!, probes[p_idx], dis_col, gd_col[dis_indices[p_idx] : dis_indices[p_idx + 1] - 1])
+    end
+
+    #=
     sparse_data_matrix_column = Array{sparse_data_node}(undef, length(gd_col))
     for i = 1 : length(gd_col)
         sparse_data_matrix_column[i] = sparse_data_node(copy(gd_col[i].rating), copy(gd_col[i].userId), i)
     end
+    =#
 
     gd_col_keys = keys(gd_col)
     id_mapping = zeros(Int64, gd_col_keys[end].movieId)
@@ -47,18 +96,37 @@ function gooby()
 
     # stored in compressed row format
     gd = groupby(df, :userId)
+
+    #=
     sparse_data_matrix_row = Array{sparse_data_node}(undef, length(gd))
     for i = 1 : length(gd)
         sparse_data_matrix_row[i] = sparse_data_node(copy(gd[i].rating), copy(id_mapping[gd[i].movieId]), i)
     end
+    =#
 
+    # compressed row format
+    dis_row = DArray(tup -> init_distributed_data_node(tup), (length(gd),), probes, (length(probes),))
+    dis_indices = dis_row.cuts[1]
+    @sync for p_idx in eachindex(probes)
+        @async remotecall_fetch(fill_with_data!, probes[p_idx], dis_row, gd[dis_indices[p_idx] : dis_indices[p_idx + 1] - 1], id_mapping=id_mapping)
+    end
 
+    
+
+    
     #iter = [1, 5, 10, 50]
-    iter = [5]
+    iter = [1]
     rank_k = 100
     regularization = 0.01
+    # create U and M
+    dis_U = dzeros((rank_k, length(dis_row)), probes, [1, length(probes)])
+    dis_M = dzeros((rank_k, length(dis_col)), probes, [1, length(probes)])
+    @assert false
     for i in iter
-        @time Ut, M = compute_factor(sparse_data_matrix_row, sparse_data_matrix_column, rank_k, regularization, i)
+        @sync for p_idx in eachindex(probes)
+            @async remotecall_fetch(compute_factor, probes[p_idx], dis_U, dis_M, dis_row, dis_col, rank_k, regularization, i)
+        end
+
 
         # verify
         actual = zeros(length(gd), length(gd_col))
@@ -74,6 +142,13 @@ function gooby()
     
 
 end
+
+
+
+
+
+
+
 
 function dolan()
     m = 5000
@@ -159,3 +234,6 @@ function dolan()
     end
     
 end
+
+
+
